@@ -77,25 +77,47 @@ def parse_options(values):
     return output
 
 
-def save_revision(name, records, owner):
+def _checksum(records, scope=''):
+    payload = json.dumps(records, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+    if scope:
+        payload = scope + '\n' + payload
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def save_revision(name, records, owner, scope=''):
     if not name.strip():
         raise ValueError('数据名称不能为空。')
-    payload = json.dumps(records, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
-    checksum = hashlib.sha256(payload.encode()).hexdigest()
+    checksum = _checksum(records, scope)
     now = time.time()
     existing = select(datasets.c.id).where(datasets.c.checksum == checksum)
     try:
         with engine.begin() as connection:
-            found = connection.scalar(existing)
-            if found is not None:
-                return found, False
-            key = connection.execute(insert(datasets).values(name=name.strip(), owner=owner, records=records,
-                                                             checksum=checksum, created=now)).inserted_primary_key[0]
-            add_event(connection, owner, 'import', key, now)
-            return key, True
+            return insert_revision(connection, name, records, owner, checksum, now)
     except IntegrityError:
         with engine.connect() as connection:
             found = connection.scalar(existing)
             if found is None:
                 raise
             return found, False
+
+
+def insert_revision(connection, name, records, owner, checksum, now):
+    """Insert one deduplicated revision inside the caller's transaction."""
+    found = connection.scalar(select(datasets.c.id).where(datasets.c.checksum == checksum))
+    if found is not None:
+        return found, False
+    try:
+        with connection.begin_nested():
+            key = connection.execute(insert(datasets).values(name=name.strip(), owner=owner, records=records,
+                                                             checksum=checksum, created=now)).inserted_primary_key[0]
+            add_event(connection, owner, 'import', key, now)
+        return key, True
+    except IntegrityError:
+        found = connection.scalar(select(datasets.c.id).where(datasets.c.checksum == checksum))
+        if found is None:
+            raise
+        return found, False
+
+
+def checksum_for(records, scope=''):
+    return _checksum(records, scope)

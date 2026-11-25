@@ -11,8 +11,10 @@ export async function review() {
   const {runs,run} = await currentRun();
   if (!run) return empty('先运行分析。','#2','配置分析');
   const gate = run.result?.can_publish === false ? '<p class="notice">当前结果未达到发布门槛，可退回复算。</p>' : '';
-  const form = run.result && !run.decision && state.account.role === 'reviewer' ? `<form id="review" data-id="${run.id}"><label>复核意见<textarea name="note" required minlength="2" maxlength="1000"></textarea></label><button type="submit" value="approved" ${gate ? 'disabled' : ''}>批准发布</button> <button type="submit" value="returned" class="secondary">退回复算</button>${errorSlot}</form>` : '';
-  return `<section>${chooseRun(runs,run.id)}<h2>${esc(state.profile.decision)}</h2><p>${esc(run.result?.headline || '分析完成后可复核。')}</p>${gate}${run.decision ? `<p class="notice">${decisions[run.decision]} · ${esc(run.reviewer)} · ${time(run.reviewed)}<br>${esc(run.review_note)}</p>` : ''}${form}<p><a href="#3/${run.id}">打开结果及口径</a> · <a href="#5/${run.id}">查看交付</a></p></section>`;
+  const stale = run.superseded ? '<p class="notice">该结果基于已被新版取代的数据版本，请复核当前生效版本；已批准的报告仍按其当时的窗口复算。</p>' : run.pending ? '<p class="notice">该结果基于尚未生效的新数据版本，暂不可批准。</p>' : '';
+  const blocked = Boolean(run.superseded || run.pending);
+  const form = run.result && !run.decision && state.account.role === 'reviewer' ? `<form id="review" data-id="${run.id}"><label>复核意见<textarea name="note" required minlength="2" maxlength="1000"></textarea></label><button type="submit" value="approved" ${gate || blocked ? 'disabled' : ''}>批准发布</button> <button type="submit" value="returned" class="secondary">退回复算</button>${errorSlot}</form>` : '';
+  return `<section>${chooseRun(runs,run.id)}<h2>${esc(state.profile.decision)}</h2><p>${esc(run.result?.headline || '分析完成后可复核。')}</p>${gate}${stale}${run.decision ? `<p class="notice">${decisions[run.decision]} · ${esc(run.reviewer)} · ${time(run.reviewed)}${run.approved_version != null ? ` · 批准版本 v${run.approved_version}` : ''}<br>${esc(run.review_note)}</p>` : ''}${form}<p><a href="#3/${run.id}">打开结果及口径</a> · <a href="#5/${run.id}">查看交付</a></p></section>`;
 }
 
 export async function delivery() {
@@ -21,9 +23,10 @@ export async function delivery() {
   const fixedRecipient = run?.result?.dispatch_recipient;
   const share = reviewer && run?.decision === 'approved' ? `<form id="schedule" class="inline-form" data-id="${run.id}"><label>站内收件组<input name="recipient" value="${esc(fixedRecipient ?? state.profile.recipient)}" ${fixedRecipient ? 'readonly' : ''} minlength="2" maxlength="100" required></label><label>频率<select name="cadence"><option value="once">单次</option><option value="daily">每日同一时间</option></select></label><label>首次投递时间<input name="scheduled_at" type="datetime-local"></label><button type="submit">建立投递计划</button>${errorSlot}</form>` : '<p class="hint">批准后，复核员可设置投递计划。</p>';
   const exportButton = run?.result && (run.decision === 'approved' || state.account.role !== 'viewer') ? `<button id="report-download" class="secondary" data-id="${run.id}" type="button">下载结果 CSV</button>` : '';
+  const versionNote = run?.approved_version != null ? `<p class="hint">已批准报告按批准版本 v${run.approved_version} 的窗口复算导出。</p>` : '';
   const planTable = table(box.schedules.map(row => ({计划:row.id,任务:row.run_id,收件组:row.recipient,频率:row.cadence === 'daily' ? '每日' : '单次',计划时间:time(row.next_at),状态:row.active ? '启用' : '关闭'})));
   const stop = reviewer && box.schedules.some(row => row.active) ? `<form id="stop" class="inline-form"><label>启用中的计划<select name="schedule">${box.schedules.filter(row => row.active).map(row => `<option value="${row.id}">#${row.id} · ${esc(row.recipient)}</option>`).join('')}</select></label><button type="submit" class="secondary">停止计划</button>${errorSlot}</form>` : '';
-  return `<section><h2>报告分发</h2>${run ? chooseRun(runs,run.id) : ''}${share}${exportButton}<p id="delivery-error" class="error" role="alert"></p></section><section><h2>投递计划</h2>${planTable}${stop}</section><section><h2>收件箱</h2>${table(box.deliveries.map(row => ({投递:row.id,收件组:row.recipient,报告:{link:`#3/${row.run_id}`,text:`分析 #${row.run_id}`},入箱时间:time(row.delivered)})))}</section>`;
+  return `<section><h2>报告分发</h2>${run ? chooseRun(runs,run.id) : ''}${share}${versionNote}${exportButton}<p id="delivery-error" class="error" role="alert"></p></section><section><h2>投递计划</h2>${planTable}${stop}</section><section><h2>收件箱</h2>${table(box.deliveries.map(row => ({投递:row.id,收件组:row.recipient,报告:{link:`#3/${row.run_id}`,text:`分析 #${row.run_id}`},入箱时间:time(row.delivered)})))}</section>`;
 }
 
 export function bindDispatch(root,refresh) {

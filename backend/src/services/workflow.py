@@ -4,9 +4,28 @@ from fastapi import HTTPException
 from sqlalchemy import and_, insert, or_, select, update
 
 from src.constants.enums import State
+from src.config.settings import ARTIFACTS
 from src.models.database import add_event, engine, fetch_one
 from src.models.tables import datasets, deliveries, runs, schedules
 from src.services.data import parse_options
+from src.services.domain import compute
+from src.services.revisions import (activate_run, annotate, approval_pin, pin_approval,
+                                    revision_info)
+from src.utils.exports import write_csv
+
+
+def run_detail(key):
+    """Single run with lineage flags (current / superseded / pending)."""
+    with engine.connect() as connection:
+        row = fetch_one(connection, runs, key)
+        if row is None:
+            raise HTTPException(404, '分析任务不存在。')
+        detail = annotate(connection, [dict(row)], kind='run')[0]
+        pin = approval_pin(connection, key)
+    if pin:
+        detail['approved_dataset_id'] = pin['dataset_id']
+        detail['approved_version'] = pin['version']
+    return detail
 
 
 def add_run(body, actor):
@@ -15,6 +34,9 @@ def add_run(body, actor):
     with engine.begin() as connection:
         if fetch_one(connection, datasets, body.dataset_id) is None:
             raise HTTPException(404, '数据版本不存在。')
+        info = revision_info(connection, body.dataset_id)
+        if info is not None and info['kind'] == 'supplement':
+            raise HTTPException(422, '补报文件不能直接分析，请分析其合并后的数据版本。')
         key = connection.execute(insert(runs).values(dataset_id=body.dataset_id, options=options,
                     state=State.queued.value, owner=actor, created=now)).inserted_primary_key[0]
         add_event(connection, actor, 'queue', key, now)
@@ -46,6 +68,41 @@ def finish_run(key, claim, result, error):
                                                   error=error, finished=now))
         if saved.rowcount:
             add_event(connection, 'worker', state, key, now)
+            if not error:
+                activate_run(connection, key, now)
+
+
+def report_data(key):
+    """Return report bytes and the dataset version they belong to.
+
+    An approved run is pinned to the version and windows reviewed at approval time,
+    so later supplement merges neither rewrite it nor block it. A draft run
+    recomputes on its own recorded version.
+    """
+    with engine.connect() as connection:
+        run = fetch_one(connection, runs, key)
+        if run is None:
+            raise HTTPException(404, '分析任务不存在。')
+        pin = approval_pin(connection, key)
+        info = revision_info(connection, run['dataset_id'])
+    if not run['result']:
+        raise HTTPException(409, '分析结果尚不可导出。')
+    version = pin['version'] if pin else (info['seq'] if info else 0)
+    dataset_id = pin['dataset_id'] if pin else run['dataset_id']
+    path = ARTIFACTS / f"run-{key}-{run['started'].hex()}.csv"
+    if path.exists():
+        return path.read_bytes(), version
+    dataset = require_dataset(dataset_id)
+    result = compute(dataset['records'], run['options'])
+    return write_csv(result['rows'], result.get('columns')), version
+
+
+def require_dataset(dataset_id):
+    with engine.connect() as connection:
+        row = fetch_one(connection, datasets, dataset_id)
+    if row is None:
+        raise HTTPException(409, '报告所绑定的数据版本已不可用。')
+    return dict(row)
 
 
 def review_run(key, body, actor):
@@ -59,12 +116,21 @@ def review_run(key, body, actor):
             raise HTTPException(404, '分析任务不存在。')
         if run['state'] != State.completed.value:
             raise HTTPException(409, '分析完成后才能复核。')
-        if body.decision == 'approved' and run['result'].get('can_publish') is False:
-            raise HTTPException(409, '结果未达到本项目的发布门槛。')
+        detail = annotate(connection, [dict(run)], kind='run')[0]
+        if body.decision == 'approved':
+            if detail.get('superseded'):
+                raise HTTPException(409, '该结果基于已被新版取代的数据版本，请复核当前生效版本。')
+            if detail.get('pending'):
+                raise HTTPException(409, '该结果基于尚未生效的新数据版本，暂不可批准。')
+            if run['result'].get('can_publish') is False:
+                raise HTTPException(409, '结果未达到本项目的发布门槛。')
         updated = connection.execute(update(runs).where(runs.c.id == key, runs.c.decision.is_(None))
                                      .values(decision=body.decision, reviewer=actor, review_note=note, reviewed=now))
         if updated.rowcount != 1:
             raise HTTPException(409, '已完成复核。请重新运行分析以提交新的复核。')
+        if body.decision == 'approved':
+            info = revision_info(connection, run['dataset_id'])
+            pin_approval(connection, key, run['dataset_id'], info['seq'] if info else 0, now)
         add_event(connection, actor, body.decision, key, now)
     return {'decision': body.decision}
 

@@ -11,11 +11,13 @@ from src.middlewares.http import install
 from src.models.database import cache, engine
 from src.models.tables import metadata
 from src.routes.api import router
+from src.services.revisions import bootstrap
 
 
 @asynccontextmanager
 async def lifespan(app):
     metadata.create_all(engine)
+    bootstrap()
     if SEED:
         try:
             logging.info('Demo seed: %s', seed())

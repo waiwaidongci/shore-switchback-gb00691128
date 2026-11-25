@@ -2,14 +2,16 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
-from src.config.settings import ARTIFACTS
 from src.constants.enums import Role
-from src.controllers.query import delivery_status, jobs, recent_activity, require_row, revisions
-from src.models.tables import datasets, runs
-from src.schemas.requests import Delivery, Import, Login, Review, Run
+from src.controllers.query import (dataset_detail, delivery_status, jobs, recent_activity,
+                                   require_row, revisions)
+from src.models.tables import runs
+from src.schemas.requests import Delivery, Import, Login, Review, Run, Supplement
 from src.services.data import PROFILE, csv_records, save_revision
 from src.services.domain import sample_rows
-from src.services.workflow import add_run, cancel_schedule, review_run, schedule_report
+from src.services.revisions import import_supplement, register_base
+from src.services.workflow import (add_run, cancel_schedule, report_data, review_run,
+                                   run_detail, schedule_report)
 from src.utils.exports import write_csv
 from src.utils.security import allowed, authenticate, signed_in
 
@@ -50,16 +52,22 @@ def list_datasets(account=Depends(signed_in)):
 
 @router.get('/datasets/{key}')
 def get_dataset(key: int, account=Depends(signed_in)):
-    dataset = require_row(datasets, key, '数据版本')
-    records = dataset.pop('records')
-    return {**dataset, 'count': len(records), 'records': records[:100]}
+    return dataset_detail(key)
 
 
 @router.post('/datasets', status_code=201)
 def import_data(body: Import, account=Depends(analyst)):
     rows = csv_records(body.csv)
     key, created = save_revision(body.name, rows, account['username'])
+    if created:
+        register_base(key)
     return {'id': key, 'created': created, 'rows': len(rows)}
+
+
+@router.post('/datasets/supplement', status_code=201)
+def supplement(body: Supplement, account=Depends(analyst)):
+    rows = csv_records(body.csv)
+    return import_supplement(body.base_id, body.name, rows, account['username'])
 
 
 @router.get('/runs')
@@ -74,7 +82,7 @@ def queue(body: Run, account=Depends(analyst)):
 
 @router.get('/runs/{key}')
 def result(key: int, account=Depends(signed_in)):
-    return require_row(runs, key, '分析任务')
+    return run_detail(key)
 
 
 @router.post('/runs/{key}/review')
@@ -107,8 +115,6 @@ def report(key: int, account=Depends(signed_in)):
     run = require_row(runs, key, '分析任务')
     if run['decision'] != 'approved' and account['role'] == Role.viewer.value:
         raise HTTPException(403, '只读账号可导出已批准的报告。')
-    if not run['result']:
-        raise HTTPException(409, '分析结果尚不可导出。')
-    path = ARTIFACTS / f"run-{key}-{run['started'].hex()}.csv"
-    data = path.read_bytes() if path.exists() else write_csv(run['result']['rows'], run['result'].get('columns'))
-    return download_csv(data, f"{PROFILE['title']}-{key}.csv")
+    data, version = report_data(key)
+    suffix = f"-v{version}" if version else ''
+    return download_csv(data, f"{PROFILE['title']}-{key}{suffix}.csv")

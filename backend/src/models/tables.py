@@ -7,6 +7,24 @@ datasets = Table('data_revisions', metadata, Column('id', Integer, primary_key=T
                  Column('name', String(180), nullable=False), Column('checksum', String(64), nullable=False, unique=True),
                  Column('records', JSON, nullable=False), Column('owner', String(40), nullable=False),
                  Column('created', Double, nullable=False))
+revision_meta = Table('revision_meta', metadata, Column('dataset_id', Integer, primary_key=True),
+                      Column('kind', String(16), nullable=False), Column('base_id', Integer, nullable=True, index=True),
+                      Column('seq', Integer, nullable=False, default=1), Column('created', Double, nullable=False))
+base_versions = Table('base_versions', metadata, Column('base_id', Integer, primary_key=True),
+                      Column('latest_dataset_id', Integer, nullable=False), Column('latest_seq', Integer, nullable=False),
+                      Column('active_dataset_id', Integer, nullable=True), Column('active_seq', Integer, nullable=False),
+                      Column('active_run_id', Integer, nullable=True), Column('updated', Double, nullable=False))
+supplement_links = Table('supplement_links', metadata, Column('id', Integer, primary_key=True),
+                         Column('base_id', Integer, nullable=False, index=True),
+                         Column('supplement_id', Integer, nullable=False, index=True),
+                         Column('created', Double, nullable=False), UniqueConstraint('base_id', 'supplement_id'))
+merge_reports = Table('merge_reports', metadata, Column('id', Integer, primary_key=True),
+                      Column('base_id', Integer, nullable=False, index=True),
+                      Column('merged_id', Integer, nullable=True, index=True), Column('seq', Integer, nullable=False),
+                      Column('report', JSON, nullable=False), Column('created', Double, nullable=False))
+approval_pins = Table('approval_pins', metadata, Column('run_id', Integer, primary_key=True),
+                      Column('dataset_id', Integer, nullable=False),
+                      Column('version', Integer, nullable=False), Column('approved', Double, nullable=False))
 runs = Table('analysis_runs', metadata, Column('id', Integer, primary_key=True),
              Column('dataset_id', Integer, nullable=False, index=True), Column('options', JSON, nullable=False),
              Column('state', String(16), nullable=False, index=True), Column('owner', String(40), nullable=False),

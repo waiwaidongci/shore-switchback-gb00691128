@@ -14,6 +14,12 @@ class Import(BaseModel):
     csv: str = Field(min_length=1, max_length=1_000_000)
 
 
+class Supplement(BaseModel):
+    base_id: int = Field(gt=0)
+    name: str = Field(min_length=1, max_length=180)
+    csv: str = Field(min_length=1, max_length=1_000_000)
+
+
 class Run(BaseModel):
     dataset_id: int = Field(gt=0)
     options: dict = Field(default_factory=dict)

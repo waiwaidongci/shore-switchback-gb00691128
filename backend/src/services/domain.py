@@ -133,6 +133,169 @@ def _read_ledger(rows: list[dict]) -> tuple[dict, dict, dict]:
     return plans, orders, windows
 
 
+def _planned_keys(plans: dict) -> set[tuple[str, int, int, int]]:
+    return {
+        (zone, pair, block, slot)
+        for zone, plan in plans.items()
+        for pair in range(1, plan.pair_count + 1)
+        for block in (1, 2)
+        for slot in range(SLOTS_PER_BLOCK)
+    }
+
+
+def _window_key(row: dict, plan: Plan, label: str) -> tuple[str, int, int, int]:
+    pair, block = row["pair"], row["block"]
+    window_start = _parse_time(row["window_start"], f"{label}的窗口起点")
+    block_start = plan.pair_start(pair) + timedelta(hours=BLOCK_HOURS * (block - 1))
+    slot, remainder = divmod(window_start - block_start, timedelta(hours=SLOT_HOURS))
+    if remainder or not 0 <= slot < SLOTS_PER_BLOCK:
+        raise ValueError(f"{label}窗口越界或未对齐 2 小时网格，请按该班次起点重填。")
+    return (row["zone"].strip(), pair, block, slot)
+
+
+def _supplement_candidates(plans: dict, base_orders: dict, base_windows: dict,
+                           rows: list[dict], label: str) -> dict:
+    """Validate one supplemental file against the frozen schedule and index its rows.
+
+    Supplemental rows may only address planned windows that the original revision
+    never reported; duplicates are allowed here because they are reconciled as a
+    set later, independent of the order in which files arrived.
+    """
+    planned = _planned_keys(plans)
+    zone_count = len(plans)
+    candidates = defaultdict(list)
+    for index, row in enumerate(rows, 2):
+        zone = row["zone"].strip()
+        where = f"{label}第 {index} 行（{zone}）"
+        if zone not in plans:
+            raise ValueError(f"{where}不在冻结排班的作业区内，请核对作业区名称。")
+        plan = plans[zone]
+        if row["planned_zones"] != zone_count:
+            raise ValueError(f"{where}计划作业区数与冻结排班不符，请按冻结排班补报。")
+        if row["planned_pairs"] != plan.pair_count:
+            raise ValueError(f"{where}计划配对数与冻结排班不符，请按冻结排班补报。")
+        if _parse_time(row["plan_start"], f"{where}的计划起点") != plan.start:
+            raise ValueError(f"{where}计划起点与冻结排班不符，请按冻结排班补报。")
+        pair, block = row["pair"], row["block"]
+        if not 1 <= pair <= plan.pair_count or block not in (1, 2):
+            raise ValueError(f"{where}配对号或班次号超出冻结排班，请补录计划内配对号及班次 1 或 2。")
+        order = row["sequence"]
+        if order not in ORDERS:
+            raise ValueError(f"{where}随机排班顺序须为 AB 或 BA，请核对冻结排班。")
+        if row["guide"] != order[block - 1]:
+            raise ValueError(f"{where}发布指引与分配顺序不符，请核对发布日志后再补报。")
+        key = _window_key(row, plan, where)
+        if key not in planned:
+            raise ValueError(f"{where}窗口不在冻结排班内，补报只能填补计划窗口。")
+        if key in base_windows:
+            raise ValueError(f"{where}窗口已有原始记录，补报只能填补冻结排班里最初缺报的窗口。")
+        if (zone, pair) in base_orders and base_orders[(zone, pair)] != order:
+            raise ValueError(f"{where}与冻结排班的分配顺序冲突，补报不得改变随机排班。")
+        eligible, on_time = row["eligible"], row["on_time"]
+        if not 0 <= on_time <= eligible:
+            raise ValueError(f"{where}工单数无效，请填报非负分母，且达标数不得超过计划工单数。")
+        candidates[key].append((order, row["guide"], eligible, on_time))
+    return candidates
+
+
+def merge_supplements(base_rows: list[dict],
+                      supplement_sets: list[list[dict]]) -> tuple[list[dict], dict]:
+    """Merge supplemental reports into the original revision, order-independently.
+
+    A planned window that the original revision never reported may be filled only
+    when every supplemental value for it agrees. Identical values for the same
+    window collapse to one copy; differing values are a count conflict and the
+    window stays missing. Because all supplemental files are treated as one set,
+    concurrent or out-of-order arrivals produce the same merged windows.
+    """
+    plans, base_orders, base_windows = _read_ledger(base_rows)
+    planned = _planned_keys(plans)
+    observed: dict[tuple[str, int, int, int], list[tuple]] = defaultdict(list)
+    pair_orders: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for index, rows in enumerate(supplement_sets):
+        if not rows:
+            continue
+        candidates = _supplement_candidates(plans, base_orders, base_windows, rows,
+                                            f"补报 {index + 1} ")
+        for key, values in candidates.items():
+            observed[key].extend(values)
+            pair_orders[(key[0], key[1])].update(order for order, _, _, _ in values)
+
+    resolved = dict(base_orders)
+    unresolved = set()
+    for (zone, pair), orders in pair_orders.items():
+        if (zone, pair) in resolved:
+            continue
+        if len(orders) == 1:
+            resolved[(zone, pair)] = next(iter(orders))
+        else:
+            unresolved.add((zone, pair))
+
+    filled = {}
+    conflicts = []
+    duplicates = 0
+    for key in sorted(observed):
+        zone, pair, block, slot = key
+        order = resolved.get((zone, pair))
+        values = observed[key]
+        valid = [value for value in values
+                 if order is not None and value[0] == order and value[1] == order[block - 1]]
+        invalid = len(values) - len(valid)
+        counts = {(eligible, on_time) for _, _, eligible, on_time in valid}
+        if order is not None and invalid == 0 and len(counts) == 1:
+            eligible, on_time = next(iter(counts))
+            filled[key] = (order, eligible, on_time)
+            duplicates += max(0, len(valid) - 1)
+        else:
+            plan = plans[zone]
+            start = (plan.pair_start(pair) + timedelta(hours=BLOCK_HOURS * (block - 1))
+                     + timedelta(hours=SLOT_HOURS * slot)).strftime(TIME_FORMAT)
+            conflicts.append({
+                "zone": zone,
+                "pair": pair,
+                "block": block,
+                "slot": slot,
+                "window_start": start,
+                "counts": [{"eligible": eligible, "on_time": on_time}
+                           for eligible, on_time in sorted(counts)],
+                "invalid_supplements": invalid,
+            })
+
+    zone_count = len(plans)
+    merged = [dict(row) for row in base_rows]
+    for key, (order, eligible, on_time) in sorted(filled.items()):
+        zone, pair, block, slot = key
+        plan = plans[zone]
+        block_start = plan.pair_start(pair) + timedelta(hours=BLOCK_HOURS * (block - 1))
+        merged.append({
+            "zone": zone,
+            "planned_zones": zone_count,
+            "plan_start": plan.start.strftime(TIME_FORMAT),
+            "planned_pairs": plan.pair_count,
+            "pair": pair,
+            "block": block,
+            "window_start": (block_start + timedelta(hours=SLOT_HOURS * slot)).strftime(TIME_FORMAT),
+            "sequence": order,
+            "guide": order[block - 1],
+            "eligible": eligible,
+            "on_time": on_time,
+        })
+    merged.sort(key=lambda row: (row["zone"], row["pair"], row["block"], row["window_start"]))
+    report = {
+        "planned_windows": len(planned),
+        "base_windows": len(base_windows),
+        "missing_windows": len(planned) - len(base_windows),
+        "filled_windows": len(filled),
+        "remaining_missing_windows": len(planned) - len(base_windows) - len(filled),
+        "duplicate_supplements": duplicates,
+        "conflict_windows": len(conflicts),
+        "conflicts": conflicts,
+        "unresolved_pairs": [{"zone": zone, "pair": pair} for zone, pair in sorted(unresolved)],
+        "supplement_files": sum(1 for rows in supplement_sets if rows),
+    }
+    return merged, report
+
+
 def _option_number(options: dict, key: str, default: int | float, minimum: int | float,
                    maximum: int | float, label: str) -> Fraction:
     try:
